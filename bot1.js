@@ -4,16 +4,18 @@ console.log("MONGO:", process.env.MONGO_URL);
 const TelegramBot = require("node-telegram-bot-api");
 const mongoose = require("mongoose");
 const schedule = require("node-schedule");
+const express = require("express");
 
 // ===== ENV =====
 const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
 
-// 👉 PUT YOUR TELEGRAM USER ID (NUMBER ONLY)
-const ADMIN_ID = 6517248246;
+// 👉 PUT YOUR TELEGRAM USER ID
+const ADMIN_ID = 123456789;
 
 // ===== INIT =====
 const bot = new TelegramBot(token, { polling: true });
+const app = express();
 
 // ===== DB CONNECT =====
 mongoose.connect(MONGO);
@@ -25,10 +27,10 @@ mongoose.connection.once("open", () => {
 const postSchema = new mongoose.Schema({
   chatId: Number,
   text: String,
-  time: Date,      // for one-time
-  daily: Boolean,  // true/false
-  hour: Number,    // for daily (IST)
-  minute: Number   // for daily (IST)
+  time: Date,
+  daily: Boolean,
+  hour: Number,
+  minute: Number
 });
 const Post = mongoose.model("Post", postSchema);
 
@@ -44,7 +46,7 @@ function isAdmin(msg) {
 
 let isPaused = false;
 
-// ===== STORE CHAT IDS =====
+// ===== STORE CHAT IDs =====
 bot.on("message", async (msg) => {
   try {
     const exists = await Chat.findOne({ chatId: msg.chat.id });
@@ -52,14 +54,14 @@ bot.on("message", async (msg) => {
   } catch {}
 });
 
-// ===== START + UI =====
+// ===== START + BUTTON UI =====
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, "🤖 CoinTRX Control Panel (IST)", {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "📅 Schedule Post", callback_data: "schedule" }],
-        [{ text: "🔁 Daily Post", callback_data: "daily" }],
-        [{ text: "📋 View Posts", callback_data: "list" }],
+        [{ text: "📅 Schedule", callback_data: "schedule" }],
+        [{ text: "🔁 Daily", callback_data: "daily" }],
+        [{ text: "📋 Posts", callback_data: "list" }],
         [{ text: "📢 Broadcast", callback_data: "broadcast" }],
         [{ text: "📊 Stats", callback_data: "stats" }],
         [
@@ -72,76 +74,78 @@ bot.onText(/\/start/, (msg) => {
 });
 
 // ===== BUTTON HANDLER =====
-bot.on("callback_query", async (query) => {
-  const msg = query.message;
-  const data = query.data;
+bot.on("callback_query", async (q) => {
+  const msg = q.message;
 
-  if (query.from.id !== ADMIN_ID) {
-    return bot.answerCallbackQuery(query.id, { text: "❌ Not allowed" });
+  if (q.from.id !== ADMIN_ID) {
+    return bot.answerCallbackQuery(q.id, { text: "❌ Not allowed" });
   }
 
-  if (data === "schedule") {
-    await bot.sendMessage(msg.chat.id, "📅 Use:\n/schedule HH:MM message\nExample: /schedule 19:01 Hello 🚀");
+  if (q.data === "schedule") {
+    bot.sendMessage(msg.chat.id, "Use:\n/schedule HH:MM message");
   }
 
-  if (data === "daily") {
-    await bot.sendMessage(msg.chat.id, "🔁 Use:\n/daily HH:MM message\nExample: /daily 09:00 Good Morning ☀️");
+  if (q.data === "daily") {
+    bot.sendMessage(msg.chat.id, "Use:\n/daily HH:MM message");
   }
 
-  if (data === "list") {
+  if (q.data === "list") {
     const posts = await Post.find();
-    if (!posts.length) {
-      await bot.sendMessage(msg.chat.id, "No posts found");
-    } else {
-      let text = "📋 POSTS:\n\n";
-      posts.forEach(p => {
-        text += `ID: ${p._id}\n`;
-        text += p.daily
-          ? `Daily (IST): ${String(p.hour).padStart(2,"0")}:${String(p.minute).padStart(2,"0")}\n`
-          : `One-time: ${p.time}\n`;
-        text += `Msg: ${p.text}\n\n`;
-      });
-      await bot.sendMessage(msg.chat.id, text);
-    }
+    let text = "📋 POSTS:\n\n";
+
+    posts.forEach(p => {
+      text += `ID: ${p._id}\n`;
+      text += p.daily
+        ? `Daily: ${p.hour}:${p.minute}\n`
+        : `One-time\n`;
+      text += `Msg: ${p.text}\n\n`;
+    });
+
+    bot.sendMessage(msg.chat.id, text || "No posts");
   }
 
-  if (data === "broadcast") {
-    await bot.sendMessage(msg.chat.id, "📢 Use:\n/broadcast your message");
+  if (q.data === "broadcast") {
+    bot.sendMessage(msg.chat.id, "Use:\n/broadcast message");
   }
 
-  if (data === "stats") {
+  if (q.data === "stats") {
     const users = await Chat.countDocuments();
     const posts = await Post.countDocuments();
-    await bot.sendMessage(msg.chat.id, `📊 Stats:\nUsers: ${users}\nPosts: ${posts}`);
+
+    bot.sendMessage(msg.chat.id,
+      `📊 Users: ${users}\nPosts: ${posts}`
+    );
   }
 
-  if (data === "pause") {
+  if (q.data === "pause") {
     isPaused = true;
-    await bot.sendMessage(msg.chat.id, "⏸ All posts paused");
+    bot.sendMessage(msg.chat.id, "⏸ Paused");
   }
 
-  if (data === "resume") {
+  if (q.data === "resume") {
     isPaused = false;
-    await bot.sendMessage(msg.chat.id, "▶ Bot resumed");
+    bot.sendMessage(msg.chat.id, "▶ Resumed");
   }
 
-  bot.answerCallbackQuery(query.id);
+  bot.answerCallbackQuery(q.id);
 });
 
 // ===== ONE-TIME SCHEDULE (IST) =====
-bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return bot.sendMessage(msg.chat.id, "❌ Not authorized");
+bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, m) => {
+  if (!isAdmin(msg)) return;
 
-  let [_, hour, minute, text] = match;
+  let [_, hour, minute, text] = m;
   hour = parseInt(hour);
   minute = parseInt(minute);
 
-  const nowIST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
-  const date = new Date(nowIST);
+  const now = new Date(
+    new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
+  );
 
+  const date = new Date(now);
   date.setHours(hour, minute, 0);
 
-  if (date < nowIST) date.setDate(date.getDate() + 1);
+  if (date < now) date.setDate(date.getDate() + 1);
 
   const post = await Post.create({
     chatId: msg.chat.id,
@@ -155,14 +159,14 @@ bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
     await bot.sendMessage(post.chatId, post.text);
   });
 
-  bot.sendMessage(msg.chat.id, `✅ Scheduled (IST)\nID: ${post._id}`);
+  bot.sendMessage(msg.chat.id, `✅ Scheduled ID: ${post._id}`);
 });
 
 // ===== DAILY (IST) =====
-bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
+bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, m) => {
   if (!isAdmin(msg)) return;
 
-  let [_, hour, minute, text] = match;
+  let [_, hour, minute, text] = m;
   hour = parseInt(hour);
   minute = parseInt(minute);
 
@@ -183,62 +187,38 @@ bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
     await bot.sendMessage(post.chatId, post.text);
   });
 
-  bot.sendMessage(msg.chat.id, `🔁 Daily post set (IST)\nID: ${post._id}`);
+  bot.sendMessage(msg.chat.id, `🔁 Daily ID: ${post._id}`);
 });
 
 // ===== DELETE =====
-bot.onText(/\/delete (.+)/, async (msg, match) => {
+bot.onText(/\/delete (.+)/, async (msg, m) => {
   if (!isAdmin(msg)) return;
 
-  const id = match[1];
+  const id = m[1];
   await Post.findByIdAndDelete(id);
 
   const job = schedule.scheduledJobs[id];
   if (job) job.cancel();
 
-  bot.sendMessage(msg.chat.id, "❌ Post deleted & stopped");
+  bot.sendMessage(msg.chat.id, "❌ Deleted");
 });
 
 // ===== BROADCAST =====
-bot.onText(/\/broadcast (.+)/, async (msg, match) => {
+bot.onText(/\/broadcast (.+)/, async (msg, m) => {
   if (!isAdmin(msg)) return;
 
-  const message = match[1];
   const chats = await Chat.find();
 
-  for (let chat of chats) {
+  for (let c of chats) {
     try {
-      await bot.sendMessage(chat.chatId, message);
+      await bot.sendMessage(c.chatId, m[1]);
     } catch {}
   }
 
-  bot.sendMessage(msg.chat.id, "📢 Broadcast sent");
+  bot.sendMessage(msg.chat.id, "📢 Sent");
 });
 
-// ===== STATS =====
-bot.onText(/\/stats/, async (msg) => {
-  if (!isAdmin(msg)) return;
-
-  const users = await Chat.countDocuments();
-  const posts = await Post.countDocuments();
-
-  bot.sendMessage(msg.chat.id, `📊 Stats:\nUsers: ${users}\nPosts: ${posts}`);
-});
-
-// ===== PAUSE / RESUME =====
-bot.onText(/\/pause/, (msg) => {
-  if (!isAdmin(msg)) return;
-  isPaused = true;
-  bot.sendMessage(msg.chat.id, "⏸ All posts paused");
-});
-
-bot.onText(/\/resume/, (msg) => {
-  if (!isAdmin(msg)) return;
-  isPaused = false;
-  bot.sendMessage(msg.chat.id, "▶ Bot resumed");
-});
-
-// ===== LOAD SAVED JOBS =====
+// ===== LOAD JOBS =====
 async function loadJobs() {
   const posts = await Post.find();
 
@@ -260,12 +240,23 @@ async function loadJobs() {
     }
   });
 
-  console.log("🚀 Jobs loaded (IST)");
+  console.log("🚀 Jobs Loaded");
 }
 
 loadJobs();
 
-// ===== GLOBAL ERROR HANDLER =====
+// ===== EXPRESS SERVER (FOR 24/7) =====
+app.get("/", (req, res) => {
+  res.send("Bot is running");
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log("🌐 Server running on port " + PORT);
+});
+
+// ===== ERROR HANDLER =====
 process.on("uncaughtException", (err) => {
   console.log("ERROR:", err);
 });
