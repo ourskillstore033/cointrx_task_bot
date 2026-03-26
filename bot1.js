@@ -11,7 +11,7 @@ const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
 
 // 👉 PUT YOUR TELEGRAM USER ID
-const ADMIN_ID = 6517248246;
+const ADMIN_ID = 6517248246 , 7419362470 , 8530664171;
 
 // ===== INIT =====
 const bot = new TelegramBot(token, { polling: true });
