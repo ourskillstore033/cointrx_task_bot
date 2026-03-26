@@ -1,25 +1,27 @@
 console.log("TOKEN:", process.env.BOT_TOKEN);
 console.log("MONGO:", process.env.MONGO_URL);
 
-const TelegramBot = require('node-telegram-bot-api');
-const schedule = require('node-schedule');
-const mongoose = require('mongoose');
+const TelegramBot = require("node-telegram-bot-api");
+const mongoose = require("mongoose");
+const schedule = require("node-schedule");
 
-// ENV VARIABLES
+// ENV
 const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
+
+// ADMIN ID (PUT YOUR TELEGRAM ID)
+const ADMIN_ID = 6517248246;
 
 // BOT INIT
 const bot = new TelegramBot(token, { polling: true });
 
-// CONNECT MONGODB
+// CONNECT DB
 mongoose.connect(MONGO);
-
-mongoose.connection.once('open', () => {
+mongoose.connection.once("open", () => {
   console.log("✅ MongoDB Connected");
 });
 
-// SCHEMA
+// SCHEMAS
 const postSchema = new mongoose.Schema({
   chatId: Number,
   type: String,
@@ -29,164 +31,167 @@ const postSchema = new mongoose.Schema({
   hour: Number,
   minute: Number
 });
-
 const Post = mongoose.model("Post", postSchema);
 
-// TEMP STORAGE
-let tempContent = {};
+const chatSchema = new mongoose.Schema({
+  chatId: Number
+});
+const Chat = mongoose.model("Chat", chatSchema);
 
-// STORE ACTIVE JOBS
-global.jobs = {};
+// ADMIN CHECK
+function isAdmin(msg) {
+  return msg.from.id === ADMIN_ID;
+}
 
-// 📩 CAPTURE CONTENT
-bot.on('message', (msg) => {
-  if (msg.text && msg.text.startsWith("/")) return;
+// PAUSE FLAG
+let isPaused = false;
 
-  tempContent[msg.chat.id] = msg;
-
-  bot.sendMessage(msg.chat.id,
-    "✅ Content saved.\n\nUse:\n/schedule YYYY-MM-DD HH:MM\n/daily HH:MM"
-  );
+// SAVE USERS/GROUPS
+bot.on("message", async (msg) => {
+  const exists = await Chat.findOne({ chatId: msg.chat.id });
+  if (!exists) {
+    await Chat.create({ chatId: msg.chat.id });
+  }
 });
 
-// 📅 ONE-TIME SCHEDULE
-bot.onText(/\/schedule (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
+// START
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, "🤖 Bot Active!");
+});
 
-  if (!tempContent[chatId]) {
-    return bot.sendMessage(chatId, "❌ Send content first");
-  }
+// SCHEDULE MESSAGE
+bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return bot.sendMessage(msg.chat.id, "❌ Not authorized");
 
-  const time = new Date(match[1]);
+  const [_, hour, minute, text] = match;
+  const now = new Date();
+  const date = new Date();
+
+  date.setHours(hour, minute, 0);
+
+  if (date < now) date.setDate(date.getDate() + 1);
 
   const post = await Post.create({
-    chatId,
-    type: getType(tempContent[chatId]),
-    content: tempContent[chatId],
-    time,
+    chatId: msg.chat.id,
+    type: "text",
+    content: { text },
+    time: date,
     daily: false
   });
 
-  scheduleJob(post);
-
-  bot.sendMessage(chatId, `📅 Scheduled!\nID: ${post._id}`);
-});
-
-// ⏱ DAILY SCHEDULE
-bot.onText(/\/daily (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-
-  if (!tempContent[chatId]) {
-    return bot.sendMessage(chatId, "❌ Send content first");
-  }
-
-  const [hour, minute] = match[1].split(":");
-
-  const post = await Post.create({
-    chatId,
-    type: getType(tempContent[chatId]),
-    content: tempContent[chatId],
-    time: new Date(),
-    daily: true,
-    hour: parseInt(hour),
-    minute: parseInt(minute)
+  schedule.scheduleJob(date, async () => {
+    if (isPaused) return;
+    await bot.sendMessage(msg.chat.id, text);
   });
 
-  scheduleDaily(post);
-
-  bot.sendMessage(chatId, `⏱ Daily post set!\nID: ${post._id}`);
+  bot.sendMessage(msg.chat.id, "✅ Scheduled");
 });
 
-// 📋 LIST POSTS
+// DAILY MESSAGE
+bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
+
+  const [_, hour, minute, text] = match;
+
+  await Post.create({
+    chatId: msg.chat.id,
+    type: "text",
+    content: { text },
+    daily: true,
+    hour,
+    minute
+  });
+
+  schedule.scheduleJob(`0 ${minute} ${hour} * * *`, async () => {
+    if (isPaused) return;
+    await bot.sendMessage(msg.chat.id, text);
+  });
+
+  bot.sendMessage(msg.chat.id, "🔁 Daily post set");
+});
+
+// LIST POSTS
 bot.onText(/\/list/, async (msg) => {
-  const posts = await Post.find({ chatId: msg.chat.id });
+  if (!isAdmin(msg)) return;
 
-  if (!posts.length) {
-    return bot.sendMessage(msg.chat.id, "📭 No scheduled posts");
-  }
-
-  let text = "📋 Scheduled Posts:\n\n";
+  const posts = await Post.find();
+  let text = "📋 Scheduled Posts:\n";
 
   posts.forEach(p => {
-    text += `ID: ${p._id}\n`;
-    text += p.daily
-      ? `Type: Daily at ${p.hour}:${p.minute}\n`
-      : `Time: ${p.time}\n`;
-    text += "-------------------\n";
+    text += `ID: ${p._id} | ${p.daily ? "Daily" : p.time}\n`;
   });
 
   bot.sendMessage(msg.chat.id, text);
 });
 
-// ❌ DELETE POST
+// DELETE POST
 bot.onText(/\/delete (.+)/, async (msg, match) => {
-  const id = match[1];
+  if (!isAdmin(msg)) return;
 
-  await Post.findByIdAndDelete(id);
-
-  if (global.jobs[id]) {
-    global.jobs[id].cancel();
-  }
-
-  bot.sendMessage(msg.chat.id, "❌ Deleted successfully");
+  await Post.findByIdAndDelete(match[1]);
+  bot.sendMessage(msg.chat.id, "❌ Deleted");
 });
 
-// 🔧 HELPER FUNCTIONS
+// BROADCAST
+bot.onText(/\/broadcast (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return;
 
-function getType(msg) {
-  if (msg.text) return "text";
-  if (msg.photo) return "photo";
-  if (msg.video) return "video";
-}
+  const message = match[1];
+  const chats = await Chat.find();
 
-// 📅 SCHEDULE ONCE
-function scheduleJob(post) {
-  const job = schedule.scheduleJob(post.time, () => {
-    sendPost(post);
-  });
+  for (let chat of chats) {
+    try {
+      await bot.sendMessage(chat.chatId, message);
+    } catch (err) {}
+  }
 
-  global.jobs[post._id] = job;
-}
+  bot.sendMessage(msg.chat.id, "📢 Broadcast sent");
+});
 
-// ⏱ DAILY
-function scheduleDaily(post) {
-  const job = schedule.scheduleJob(
-    { hour: post.hour, minute: post.minute },
-    () => sendPost(post)
+// STATS
+bot.onText(/\/stats/, async (msg) => {
+  if (!isAdmin(msg)) return;
+
+  const users = await Chat.countDocuments();
+  const posts = await Post.countDocuments();
+
+  bot.sendMessage(msg.chat.id,
+    `📊 Stats:\nUsers: ${users}\nPosts: ${posts}`
   );
+});
 
-  global.jobs[post._id] = job;
-}
+// PAUSE
+bot.onText(/\/pause/, (msg) => {
+  if (!isAdmin(msg)) return;
 
-// 📤 SEND CONTENT
-function sendPost(post) {
-  const msg = post.content;
+  isPaused = true;
+  bot.sendMessage(msg.chat.id, "⏸ Bot paused");
+});
 
-  if (post.type === "text") {
-    bot.sendMessage(post.chatId, msg.text);
-  }
+// RESUME
+bot.onText(/\/resume/, (msg) => {
+  if (!isAdmin(msg)) return;
 
-  else if (post.type === "photo") {
-    const fileId = msg.photo[msg.photo.length - 1].file_id;
-    bot.sendPhoto(post.chatId, fileId, {
-      caption: msg.caption || ""
-    });
-  }
+  isPaused = false;
+  bot.sendMessage(msg.chat.id, "▶ Bot resumed");
+});
 
-  else if (post.type === "video") {
-    bot.sendVideo(post.chatId, msg.video.file_id, {
-      caption: msg.caption || ""
-    });
-  }
-}
-
-// 🔄 LOAD ALL JOBS ON START
+// LOAD SAVED POSTS
 async function loadJobs() {
   const posts = await Post.find();
 
   posts.forEach(p => {
-    if (p.daily) scheduleDaily(p);
-    else scheduleJob(p);
+    if (p.daily) {
+      schedule.scheduleJob(`0 ${p.minute} ${p.hour} * * *`, async () => {
+        if (isPaused) return;
+        await bot.sendMessage(p.chatId, p.content.text);
+      });
+    } else {
+      schedule.scheduleJob(p.time, async () => {
+        if (isPaused) return;
+        await bot.sendMessage(p.chatId, p.content.text);
+      });
+    }
   });
 
   console.log("🚀 All scheduled jobs loaded");
