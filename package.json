@@ -1,13 +1,14 @@
 {
   "name": "cointrx-bot",
   "version": "1.0.0",
-  "main": "bot.js",
+  "main": "bot1.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot1.js"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.61.0",
     "node-schedule": "^2.1.1",
-    "mongoose": "^7.0.0"
+    "mongoose": "^7.0.0",
+    "express": "^4.18.2"
   }
 }
