@@ -5,30 +5,30 @@ const TelegramBot = require("node-telegram-bot-api");
 const mongoose = require("mongoose");
 const schedule = require("node-schedule");
 
-// ENV
+// ===== ENV =====
 const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
 
-// 👉 PUT YOUR TELEGRAM USER ID
+// 👉 PUT YOUR TELEGRAM USER ID (NUMBER ONLY)
 const ADMIN_ID = 6517248246;
 
-// INIT BOT
+// ===== INIT =====
 const bot = new TelegramBot(token, { polling: true });
 
-// CONNECT DB
+// ===== DB CONNECT =====
 mongoose.connect(MONGO);
 mongoose.connection.once("open", () => {
   console.log("✅ MongoDB Connected");
 });
 
-// SCHEMAS
+// ===== SCHEMAS =====
 const postSchema = new mongoose.Schema({
   chatId: Number,
   text: String,
-  time: Date,
-  daily: Boolean,
-  hour: Number,
-  minute: Number
+  time: Date,      // for one-time
+  daily: Boolean,  // true/false
+  hour: Number,    // for daily (IST)
+  minute: Number   // for daily (IST)
 });
 const Post = mongoose.model("Post", postSchema);
 
@@ -37,46 +37,111 @@ const chatSchema = new mongoose.Schema({
 });
 const Chat = mongoose.model("Chat", chatSchema);
 
-// ADMIN CHECK
+// ===== HELPERS =====
 function isAdmin(msg) {
   return msg.from.id === ADMIN_ID;
 }
 
-// PAUSE FLAG
 let isPaused = false;
 
-// SAVE CHAT IDs
+// ===== STORE CHAT IDS =====
 bot.on("message", async (msg) => {
-  const exists = await Chat.findOne({ chatId: msg.chat.id });
-  if (!exists) await Chat.create({ chatId: msg.chat.id });
+  try {
+    const exists = await Chat.findOne({ chatId: msg.chat.id });
+    if (!exists) await Chat.create({ chatId: msg.chat.id });
+  } catch {}
 });
 
-// START
+// ===== START + UI =====
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "🤖 Bot Active (IST Timezone)");
+  bot.sendMessage(msg.chat.id, "🤖 CoinTRX Control Panel (IST)", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📅 Schedule Post", callback_data: "schedule" }],
+        [{ text: "🔁 Daily Post", callback_data: "daily" }],
+        [{ text: "📋 View Posts", callback_data: "list" }],
+        [{ text: "📢 Broadcast", callback_data: "broadcast" }],
+        [{ text: "📊 Stats", callback_data: "stats" }],
+        [
+          { text: "⏸ Pause", callback_data: "pause" },
+          { text: "▶ Resume", callback_data: "resume" }
+        ]
+      ]
+    }
+  });
 });
 
+// ===== BUTTON HANDLER =====
+bot.on("callback_query", async (query) => {
+  const msg = query.message;
+  const data = query.data;
 
-// ============================
-// 📅 ONE-TIME SCHEDULE (IST)
-// ============================
+  if (query.from.id !== ADMIN_ID) {
+    return bot.answerCallbackQuery(query.id, { text: "❌ Not allowed" });
+  }
+
+  if (data === "schedule") {
+    await bot.sendMessage(msg.chat.id, "📅 Use:\n/schedule HH:MM message\nExample: /schedule 19:01 Hello 🚀");
+  }
+
+  if (data === "daily") {
+    await bot.sendMessage(msg.chat.id, "🔁 Use:\n/daily HH:MM message\nExample: /daily 09:00 Good Morning ☀️");
+  }
+
+  if (data === "list") {
+    const posts = await Post.find();
+    if (!posts.length) {
+      await bot.sendMessage(msg.chat.id, "No posts found");
+    } else {
+      let text = "📋 POSTS:\n\n";
+      posts.forEach(p => {
+        text += `ID: ${p._id}\n`;
+        text += p.daily
+          ? `Daily (IST): ${String(p.hour).padStart(2,"0")}:${String(p.minute).padStart(2,"0")}\n`
+          : `One-time: ${p.time}\n`;
+        text += `Msg: ${p.text}\n\n`;
+      });
+      await bot.sendMessage(msg.chat.id, text);
+    }
+  }
+
+  if (data === "broadcast") {
+    await bot.sendMessage(msg.chat.id, "📢 Use:\n/broadcast your message");
+  }
+
+  if (data === "stats") {
+    const users = await Chat.countDocuments();
+    const posts = await Post.countDocuments();
+    await bot.sendMessage(msg.chat.id, `📊 Stats:\nUsers: ${users}\nPosts: ${posts}`);
+  }
+
+  if (data === "pause") {
+    isPaused = true;
+    await bot.sendMessage(msg.chat.id, "⏸ All posts paused");
+  }
+
+  if (data === "resume") {
+    isPaused = false;
+    await bot.sendMessage(msg.chat.id, "▶ Bot resumed");
+  }
+
+  bot.answerCallbackQuery(query.id);
+});
+
+// ===== ONE-TIME SCHEDULE (IST) =====
 bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
   if (!isAdmin(msg)) return bot.sendMessage(msg.chat.id, "❌ Not authorized");
 
   let [_, hour, minute, text] = match;
-
   hour = parseInt(hour);
   minute = parseInt(minute);
 
-  const now = new Date();
-
-  const date = new Date(
-    now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" })
-  );
+  const nowIST = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const date = new Date(nowIST);
 
   date.setHours(hour, minute, 0);
 
-  if (date < now) date.setDate(date.getDate() + 1);
+  if (date < nowIST) date.setDate(date.getDate() + 1);
 
   const post = await Post.create({
     chatId: msg.chat.id,
@@ -93,15 +158,11 @@ bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
   bot.sendMessage(msg.chat.id, `✅ Scheduled (IST)\nID: ${post._id}`);
 });
 
-
-// ============================
-// 🔁 DAILY (IST FIXED)
-// ============================
+// ===== DAILY (IST) =====
 bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
   if (!isAdmin(msg)) return;
 
   let [_, hour, minute, text] = match;
-
   hour = parseInt(hour);
   minute = parseInt(minute);
 
@@ -114,8 +175,8 @@ bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
   });
 
   schedule.scheduleJob(post._id.toString(), {
-    hour: hour,
-    minute: minute,
+    hour,
+    minute,
     tz: "Asia/Kolkata"
   }, async () => {
     if (isPaused) return;
@@ -125,40 +186,11 @@ bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, match) => {
   bot.sendMessage(msg.chat.id, `🔁 Daily post set (IST)\nID: ${post._id}`);
 });
 
-
-// ============================
-// 📋 LIST POSTS
-// ============================
-bot.onText(/\/list/, async (msg) => {
-  if (!isAdmin(msg)) return;
-
-  const posts = await Post.find();
-
-  if (!posts.length) return bot.sendMessage(msg.chat.id, "No posts");
-
-  let text = "📋 POSTS:\n\n";
-
-  posts.forEach(p => {
-    text += `ID: ${p._id}\n`;
-    text += `Type: ${p.daily ? "Daily" : "One-time"}\n`;
-    text += p.daily
-      ? `Time (IST): ${p.hour}:${p.minute}\n`
-      : `Date: ${p.time}\n`;
-    text += `Msg: ${p.text}\n\n`;
-  });
-
-  bot.sendMessage(msg.chat.id, text);
-});
-
-
-// ============================
-// ❌ DELETE POST
-// ============================
+// ===== DELETE =====
 bot.onText(/\/delete (.+)/, async (msg, match) => {
   if (!isAdmin(msg)) return;
 
   const id = match[1];
-
   await Post.findByIdAndDelete(id);
 
   const job = schedule.scheduledJobs[id];
@@ -167,10 +199,7 @@ bot.onText(/\/delete (.+)/, async (msg, match) => {
   bot.sendMessage(msg.chat.id, "❌ Post deleted & stopped");
 });
 
-
-// ============================
-// 📢 BROADCAST
-// ============================
+// ===== BROADCAST =====
 bot.onText(/\/broadcast (.+)/, async (msg, match) => {
   if (!isAdmin(msg)) return;
 
@@ -186,47 +215,30 @@ bot.onText(/\/broadcast (.+)/, async (msg, match) => {
   bot.sendMessage(msg.chat.id, "📢 Broadcast sent");
 });
 
-
-// ============================
-// 📊 STATS
-// ============================
+// ===== STATS =====
 bot.onText(/\/stats/, async (msg) => {
   if (!isAdmin(msg)) return;
 
   const users = await Chat.countDocuments();
   const posts = await Post.countDocuments();
 
-  bot.sendMessage(msg.chat.id,
-    `📊 Stats:\nUsers: ${users}\nPosts: ${posts}`
-  );
+  bot.sendMessage(msg.chat.id, `📊 Stats:\nUsers: ${users}\nPosts: ${posts}`);
 });
 
-
-// ============================
-// ⏸ PAUSE
-// ============================
+// ===== PAUSE / RESUME =====
 bot.onText(/\/pause/, (msg) => {
   if (!isAdmin(msg)) return;
-
   isPaused = true;
   bot.sendMessage(msg.chat.id, "⏸ All posts paused");
 });
 
-
-// ============================
-// ▶ RESUME
-// ============================
 bot.onText(/\/resume/, (msg) => {
   if (!isAdmin(msg)) return;
-
   isPaused = false;
   bot.sendMessage(msg.chat.id, "▶ Bot resumed");
 });
 
-
-// ============================
-// 🔄 LOAD SAVED JOBS (IST)
-// ============================
+// ===== LOAD SAVED JOBS =====
 async function loadJobs() {
   const posts = await Post.find();
 
@@ -248,7 +260,12 @@ async function loadJobs() {
     }
   });
 
-  console.log("🚀 All jobs loaded (IST)");
+  console.log("🚀 Jobs loaded (IST)");
 }
 
 loadJobs();
+
+// ===== GLOBAL ERROR HANDLER =====
+process.on("uncaughtException", (err) => {
+  console.log("ERROR:", err);
+});
