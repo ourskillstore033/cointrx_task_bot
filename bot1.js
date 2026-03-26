@@ -10,22 +10,24 @@ const express = require("express");
 const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
 
-// 👉 PUT YOUR TELEGRAM USER ID
-const ADMIN_ID = 6517248246 , 7419362470 , 8530664171;
+// 👉 ADD ADMINS
+const ADMIN_IDS = [6517248246 , 7419362470 , 8530664171];
 
 // ===== INIT =====
 const bot = new TelegramBot(token, { polling: true });
 const app = express();
 
-// ===== DB CONNECT =====
+// ===== DB =====
 mongoose.connect(MONGO);
 mongoose.connection.once("open", () => {
   console.log("✅ MongoDB Connected");
 });
 
-// ===== SCHEMAS =====
+// ===== SCHEMA =====
 const postSchema = new mongoose.Schema({
   chatId: Number,
+  type: String, // text, photo, video
+  fileId: String,
   text: String,
   time: Date,
   daily: Boolean,
@@ -40,13 +42,10 @@ const chatSchema = new mongoose.Schema({
 const Chat = mongoose.model("Chat", chatSchema);
 
 // ===== HELPERS =====
-function isAdmin(msg) {
-  return msg.from.id === ADMIN_ID;
-}
-
+const isAdmin = (msg) => ADMIN_IDS.includes(msg.from.id);
 let isPaused = false;
 
-// ===== STORE CHAT IDs =====
+// ===== STORE CHAT =====
 bot.on("message", async (msg) => {
   try {
     const exists = await Chat.findOne({ chatId: msg.chat.id });
@@ -54,14 +53,15 @@ bot.on("message", async (msg) => {
   } catch {}
 });
 
-// ===== START + BUTTON UI =====
+// ===== UI =====
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "🤖 CoinTRX Control Panel (IST)", {
+  bot.sendMessage(msg.chat.id, "🚀 CoinTRX Control Panel", {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "📅 Schedule", callback_data: "schedule" }],
-        [{ text: "🔁 Daily", callback_data: "daily" }],
-        [{ text: "📋 Posts", callback_data: "list" }],
+        [{ text: "📅 Schedule Post", callback_data: "schedule" }],
+        [{ text: "🔁 Daily Post", callback_data: "daily" }],
+        [{ text: "🖼 Send Media Daily", callback_data: "media" }],
+        [{ text: "📋 View Posts", callback_data: "list" }],
         [{ text: "📢 Broadcast", callback_data: "broadcast" }],
         [{ text: "📊 Stats", callback_data: "stats" }],
         [
@@ -73,20 +73,21 @@ bot.onText(/\/start/, (msg) => {
   });
 });
 
-// ===== BUTTON HANDLER =====
+// ===== BUTTON ACTION =====
 bot.on("callback_query", async (q) => {
+  if (!ADMIN_IDS.includes(q.from.id)) return;
+
   const msg = q.message;
 
-  if (q.from.id !== ADMIN_ID) {
-    return bot.answerCallbackQuery(q.id, { text: "❌ Not allowed" });
-  }
+  const messages = {
+    schedule: "Use:\n/schedule 19:01 Hello",
+    daily: "Use:\n/daily 09:00 Good Morning",
+    media: "Send photo/video with caption:\n/daily 19:00 Message",
+    broadcast: "Use:\n/broadcast message"
+  };
 
-  if (q.data === "schedule") {
-    bot.sendMessage(msg.chat.id, "Use:\n/schedule HH:MM message");
-  }
-
-  if (q.data === "daily") {
-    bot.sendMessage(msg.chat.id, "Use:\n/daily HH:MM message");
+  if (messages[q.data]) {
+    bot.sendMessage(msg.chat.id, messages[q.data]);
   }
 
   if (q.data === "list") {
@@ -98,23 +99,16 @@ bot.on("callback_query", async (q) => {
       text += p.daily
         ? `Daily: ${p.hour}:${p.minute}\n`
         : `One-time\n`;
-      text += `Msg: ${p.text}\n\n`;
+      text += `Type: ${p.type}\nMsg: ${p.text}\n\n`;
     });
 
     bot.sendMessage(msg.chat.id, text || "No posts");
   }
 
-  if (q.data === "broadcast") {
-    bot.sendMessage(msg.chat.id, "Use:\n/broadcast message");
-  }
-
   if (q.data === "stats") {
     const users = await Chat.countDocuments();
     const posts = await Post.countDocuments();
-
-    bot.sendMessage(msg.chat.id,
-      `📊 Users: ${users}\nPosts: ${posts}`
-    );
+    bot.sendMessage(msg.chat.id, `📊 Users: ${users}\nPosts: ${posts}`);
   }
 
   if (q.data === "pause") {
@@ -130,7 +124,33 @@ bot.on("callback_query", async (q) => {
   bot.answerCallbackQuery(q.id);
 });
 
-// ===== ONE-TIME SCHEDULE (IST) =====
+// ===== DAILY TEXT =====
+bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, m) => {
+  if (!isAdmin(msg)) return;
+
+  let [_, hour, minute, text] = m;
+  hour = parseInt(hour);
+  minute = parseInt(minute);
+
+  const post = await Post.create({
+    chatId: msg.chat.id,
+    type: "text",
+    text,
+    daily: true,
+    hour,
+    minute
+  });
+
+  schedule.scheduleJob(post._id.toString(), {
+    hour,
+    minute,
+    tz: "Asia/Kolkata"
+  }, async () => sendPost(post));
+
+  bot.sendMessage(msg.chat.id, `🔁 Daily set ID: ${post._id}`);
+});
+
+// ===== SCHEDULE TEXT =====
 bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, m) => {
   if (!isAdmin(msg)) return;
 
@@ -144,51 +164,75 @@ bot.onText(/\/schedule (\d{2}):(\d{2}) (.+)/, async (msg, m) => {
 
   const date = new Date(now);
   date.setHours(hour, minute, 0);
-
   if (date < now) date.setDate(date.getDate() + 1);
 
   const post = await Post.create({
     chatId: msg.chat.id,
+    type: "text",
     text,
     time: date,
     daily: false
   });
 
-  schedule.scheduleJob(post._id.toString(), date, async () => {
-    if (isPaused) return;
-    await bot.sendMessage(post.chatId, post.text);
-  });
+  schedule.scheduleJob(post._id.toString(), date, async () => sendPost(post));
 
-  bot.sendMessage(msg.chat.id, `✅ Scheduled ID: ${post._id}`);
+  bot.sendMessage(msg.chat.id, `📅 Scheduled ID: ${post._id}`);
 });
 
-// ===== DAILY (IST) =====
-bot.onText(/\/daily (\d{2}):(\d{2}) (.+)/, async (msg, m) => {
+// ===== MEDIA DAILY =====
+bot.on("message", async (msg) => {
   if (!isAdmin(msg)) return;
 
-  let [_, hour, minute, text] = m;
-  hour = parseInt(hour);
-  minute = parseInt(minute);
+  if (msg.caption?.startsWith("/daily")) {
+    const parts = msg.caption.split(" ");
+    const [hour, minute] = parts[1].split(":").map(Number);
+    const text = msg.caption.replace(`/daily ${parts[1]}`, "").trim();
 
-  const post = await Post.create({
-    chatId: msg.chat.id,
-    text,
-    daily: true,
-    hour,
-    minute
-  });
+    let type = null;
+    let fileId = null;
 
-  schedule.scheduleJob(post._id.toString(), {
-    hour,
-    minute,
-    tz: "Asia/Kolkata"
-  }, async () => {
-    if (isPaused) return;
-    await bot.sendMessage(post.chatId, post.text);
-  });
+    if (msg.photo) {
+      type = "photo";
+      fileId = msg.photo[msg.photo.length - 1].file_id;
+    } else if (msg.video) {
+      type = "video";
+      fileId = msg.video.file_id;
+    }
 
-  bot.sendMessage(msg.chat.id, `🔁 Daily ID: ${post._id}`);
+    if (!type) return;
+
+    const post = await Post.create({
+      chatId: msg.chat.id,
+      type,
+      fileId,
+      text,
+      daily: true,
+      hour,
+      minute
+    });
+
+    schedule.scheduleJob(post._id.toString(), {
+      hour,
+      minute,
+      tz: "Asia/Kolkata"
+    }, async () => sendPost(post));
+
+    bot.sendMessage(msg.chat.id, `✅ Media daily set ID: ${post._id}`);
+  }
 });
+
+// ===== SEND POST =====
+async function sendPost(p) {
+  if (isPaused) return;
+
+  if (p.type === "photo") {
+    await bot.sendPhoto(p.chatId, p.fileId, { caption: p.text });
+  } else if (p.type === "video") {
+    await bot.sendVideo(p.chatId, p.fileId, { caption: p.text });
+  } else {
+    await bot.sendMessage(p.chatId, p.text);
+  }
+}
 
 // ===== DELETE =====
 bot.onText(/\/delete (.+)/, async (msg, m) => {
@@ -228,35 +272,22 @@ async function loadJobs() {
         hour: p.hour,
         minute: p.minute,
         tz: "Asia/Kolkata"
-      }, async () => {
-        if (isPaused) return;
-        await bot.sendMessage(p.chatId, p.text);
-      });
+      }, async () => sendPost(p));
     } else {
-      schedule.scheduleJob(p._id.toString(), p.time, async () => {
-        if (isPaused) return;
-        await bot.sendMessage(p.chatId, p.text);
-      });
+      schedule.scheduleJob(p._id.toString(), p.time, async () => sendPost(p));
     }
   });
 
   console.log("🚀 Jobs Loaded");
 }
-
 loadJobs();
 
-// ===== EXPRESS SERVER (FOR 24/7) =====
+// ===== EXPRESS SERVER =====
 app.get("/", (req, res) => {
   res.send("Bot is running");
 });
 
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, () => {
   console.log("🌐 Server running on port " + PORT);
-});
-
-// ===== ERROR HANDLER =====
-process.on("uncaughtException", (err) => {
-  console.log("ERROR:", err);
 });
