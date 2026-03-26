@@ -1,3 +1,6 @@
+console.log("TOKEN:", process.env.BOT_TOKEN);
+console.log("MONGO:", process.env.MONGO_URL);
+
 const TelegramBot = require('node-telegram-bot-api');
 const schedule = require('node-schedule');
 const mongoose = require('mongoose');
