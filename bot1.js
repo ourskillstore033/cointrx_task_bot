@@ -11,7 +11,9 @@ const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
 
 // 👉 ADD ADMINS
-const ADMIN_IDS = [6517248246 , 7419362470 , 8530664171];
+const ADMIN_IDS = [6517248246,
+                   7419362470,
+                   8530664171];
 
 // ===== INIT =====
 const bot = new TelegramBot(token, { polling: true });
