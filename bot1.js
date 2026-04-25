@@ -10,28 +10,48 @@ const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || crypto.randomBytes(32).toString("hex");
-const TIMEZONE = "Asia/Kolkata";
+const TIMEZONE = process.env.TIMEZONE || "Asia/Kolkata"; // 🔴 IMPORTANT: CHANGE THIS IF NEEDED
 
-if (!token) throw new Error("BOT_TOKEN is required");
-if (!MONGO) throw new Error("MONGO_URL is required");
+if (!token) throw new Error("❌ BOT_TOKEN is required in .env");
+if (!MONGO) throw new Error("❌ MONGO_URL is required in .env");
+
+console.log(`⚙️  TIMEZONE SET TO: ${TIMEZONE}`);
 
 // ===== ADMIN & SETTINGS =====
 const ADMIN_IDS = [6517248246, 7419362470, 8530664171];
-const BROADCAST_RATE_LIMIT = 50; // msgs/sec
-const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+const BROADCAST_RATE_LIMIT = 50;
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000;
 
 // ===== INIT =====
 const bot = new TelegramBot(token, { polling: true });
 const app = express();
 app.use(bodyParser.json());
 
+// ===== LOGGING UTILITY =====
+const logger = {
+  info: (msg) => console.log(`✅ ${new Date().toLocaleString("en-IN", { timeZone: TIMEZONE })} | ${msg}`),
+  warn: (msg) => console.log(`⚠️  ${new Date().toLocaleString("en-IN", { timeZone: TIMEZONE })} | ${msg}`),
+  error: (msg) => console.error(`❌ ${new Date().toLocaleString("en-IN", { timeZone: TIMEZONE })} | ${msg}`),
+  debug: (msg) => console.log(`🔍 ${new Date().toLocaleString("en-IN", { timeZone: TIMEZONE })} | ${msg}`),
+};
+
 // ===== DB CONNECTION =====
 mongoose.connect(MONGO, {
   serverSelectionTimeoutMS: 5000,
   retryWrites: true,
 });
-mongoose.connection.once("open", () => console.log("✅ MongoDB Connected"));
-mongoose.connection.on("error", (err) => console.error("❌ MongoDB Error:", err));
+
+mongoose.connection.once("open", () => {
+  logger.info("MongoDB Connected!");
+});
+
+mongoose.connection.on("error", (err) => {
+  logger.error(`MongoDB Error: ${err.message}`);
+});
+
+mongoose.connection.on("disconnected", () => {
+  logger.warn("MongoDB Disconnected!");
+});
 
 // ===== SCHEMAS =====
 const postSchema = new mongoose.Schema({
@@ -44,10 +64,10 @@ const postSchema = new mongoose.Schema({
   hour: Number,
   minute: Number,
   tags: [String],
-  templateName: String,
   createdAt: { type: Date, default: Date.now },
   sentCount: { type: Number, default: 0 },
   failCount: { type: Number, default: 0 },
+  nextRun: Date, // 🔴 NEW: Track when this post will next run
 });
 
 const chatSchema = new mongoose.Schema({
@@ -68,13 +88,6 @@ const analyticsSchema = new mongoose.Schema({
   avgDeliveryMs: Number,
 });
 
-const templateSchema = new mongoose.Schema({
-  name: String,
-  text: String,
-  type: { type: String, enum: ["text", "photo", "video"], default: "text" },
-  createdAt: { type: Date, default: Date.now },
-});
-
 const auditSchema = new mongoose.Schema({
   adminId: Number,
   action: String,
@@ -85,13 +98,12 @@ const auditSchema = new mongoose.Schema({
 const Post = mongoose.model("Post", postSchema);
 const Chat = mongoose.model("Chat", chatSchema);
 const Analytics = mongoose.model("Analytics", analyticsSchema);
-const Template = mongoose.model("Template", templateSchema);
 const Audit = mongoose.model("Audit", auditSchema);
 
 // ===== STATE =====
 let isPaused = false;
 const editState = {};
-let broadcastQueue = [];
+const scheduledJobs = {}; // 🔴 NEW: Track scheduled jobs locally
 
 // ===== HELPERS =====
 const isAdmin = (msg) => ADMIN_IDS.includes(msg?.from?.id);
@@ -100,21 +112,23 @@ const pad = (n) => String(n).padStart(2, "0");
 
 const formatTime = (p) =>
   p.daily
-    ? `🔁 Daily @ ${pad(p.hour)}:${pad(p.minute)} IST`
+    ? `🔁 Daily @ ${pad(p.hour)}:${pad(p.minute)} ${TIMEZONE}`
     : `📅 Once @ ${new Date(p.time).toLocaleString("en-IN", { timeZone: TIMEZONE })}`;
 
 const safeReply = async (chatId, text, opts = {}) => {
   try {
     return await bot.sendMessage(chatId, text, opts);
   } catch (err) {
-    console.error(`❌ Failed to send to ${chatId}:`, err.message);
+    logger.error(`Failed to send to ${chatId}: ${err.message}`);
   }
 };
 
 const logAudit = async (adminId, action, details = {}) => {
   try {
     await Audit.create({ adminId, action, details });
-  } catch {}
+  } catch (e) {
+    logger.error(`Audit log failed: ${e.message}`);
+  }
 };
 
 // ===== USER REGISTRATION =====
@@ -132,7 +146,9 @@ bot.on("message", async (msg) => {
       },
       { upsert: true }
     );
-  } catch {}
+  } catch (e) {
+    logger.error(`User registration failed: ${e.message}`);
+  }
 });
 
 // ===== /START CONTROL PANEL =====
@@ -148,10 +164,8 @@ bot.onText(/\/start/, (msg) => {
         [{ text: "🖼 Media Daily", callback_data: "media" }],
         [{ text: "📋 View Posts", callback_data: "list" }],
         [{ text: "📢 Broadcast", callback_data: "broadcast" }],
-        [{ text: "🎨 Templates", callback_data: "templates" }],
         [{ text: "👥 Users", callback_data: "users" }],
-        [{ text: "📊 Analytics", callback_data: "analytics" }],
-        [{ text: "📋 Audit Log", callback_data: "audit" }],
+        [{ text: "📊 Stats", callback_data: "stats" }],
         [
           { text: "⏸ Pause", callback_data: "pause" },
           { text: "▶ Resume", callback_data: "resume" },
@@ -171,32 +185,34 @@ bot.on("callback_query", async (q) => {
   const data = q.data;
 
   const helpMessages = {
-    schedule: "📅 *One-time post:*\n`/schedule HH:MM Your message`",
-    daily: "🔁 *Daily post:*\n`/daily HH:MM Your message`",
+    schedule: "📅 *One-time post:*\n`/schedule HH:MM Your message`\n\nExample:\n`/schedule 19:00 Good evening!`",
+    daily: "🔁 *Daily post:*\n`/daily HH:MM Your message`\n\nExample:\n`/daily 09:00 Good morning!`",
     media: "🖼 *Media daily:*\nSend photo/video with caption:\n`/daily HH:MM Caption`",
-    broadcast: "📢 *Broadcast:*\n`/broadcast #tag message` (optional tags)",
+    broadcast: "📢 *Broadcast:*\n`/broadcast message`",
   };
 
   if (helpMessages[data]) {
     await safeReply(chatId, helpMessages[data], { parse_mode: "Markdown" });
   }
 
-  // LIST POSTS
   if (data === "list") {
     const posts = await Post.find().sort({ createdAt: -1 }).limit(10);
     if (!posts.length) return safeReply(chatId, "📭 No posts.");
 
     for (const p of posts) {
+      const nextRun = p.nextRun ? new Date(p.nextRun).toLocaleString("en-IN", { timeZone: TIMEZONE }) : "❌ Not scheduled";
       const label = p.type !== "text" ? `[${p.type.toUpperCase()}] ` : "";
+      
       await safeReply(
         chatId,
-        `🆔 \`${p._id}\`\n${formatTime(p)}\n${label}${p.text}\n✅ Sent: ${p.sentCount} | ❌ Failed: ${p.failCount}`,
+        `🆔 \`${p._id}\`\n${formatTime(p)}\n⏱ Next run: ${nextRun}\n${label}${p.text}\n✅ Sent: ${p.sentCount} | ❌ Failed: ${p.failCount}`,
         {
           parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: [[
               { text: "✏ Edit", callback_data: `edit_${p._id}` },
               { text: "❌ Delete", callback_data: `del_${p._id}` },
+              { text: "🧪 Test", callback_data: `test_${p._id}` },
             ]],
           },
         }
@@ -204,19 +220,6 @@ bot.on("callback_query", async (q) => {
     }
   }
 
-  // TEMPLATES
-  if (data === "templates") {
-    const templates = await Template.find();
-    if (!templates.length) return safeReply(chatId, "📭 No templates.");
-
-    let msg = "🎨 *Templates:*\n\n";
-    for (const t of templates) {
-      msg += `\`${t.name}\`: ${t.text.substring(0, 30)}...\n`;
-    }
-    safeReply(chatId, msg, { parse_mode: "Markdown" });
-  }
-
-  // USERS
   if (data === "users") {
     const [total, blocked, active] = await Promise.all([
       Chat.countDocuments(),
@@ -228,64 +231,56 @@ bot.on("callback_query", async (q) => {
     });
   }
 
-  // ANALYTICS
-  if (data === "analytics") {
-    const analytics = await Analytics.find().sort({ sentAt: -1 }).limit(5);
-    if (!analytics.length) return safeReply(chatId, "📊 No data yet.");
-
-    let msg = "📊 *Recent Broadcasts:*\n\n";
-    for (const a of analytics) {
-      msg += `✅ ${a.successCount} | ❌ ${a.failCount} | ⏱ ${a.avgDeliveryMs}ms\n`;
-    }
-    safeReply(chatId, msg, { parse_mode: "Markdown" });
+  if (data === "stats") {
+    const [users, posts] = await Promise.all([Chat.countDocuments(), Post.countDocuments()]);
+    const status = isPaused ? "⏸ Paused" : "🟢 Running";
+    const jobCount = Object.keys(scheduledJobs).length;
+    
+    await safeReply(
+      chatId,
+      `📊 *Bot Stats*\n\n👥 Users: ${users}\n📬 Posts: ${posts}\n⏰ Active Jobs: ${jobCount}\n🔄 Status: ${status}\n⏱ Timezone: ${TIMEZONE}`,
+      { parse_mode: "Markdown" }
+    );
   }
 
-  // AUDIT LOG
-  if (data === "audit") {
-    const logs = await Audit.find().sort({ timestamp: -1 }).limit(5);
-    let msg = "📋 *Recent Actions:*\n\n";
-    for (const log of logs) {
-      const time = log.timestamp.toLocaleString("en-IN", { timeZone: TIMEZONE });
-      msg += `${log.action} @ ${time}\n`;
-    }
-    safeReply(chatId, msg, { parse_mode: "Markdown" });
-  }
-
-  // EDIT POST
   if (data.startsWith("edit_")) {
     const id = data.split("_")[1];
     editState[q.from.id] = { postId: id, step: "text" };
     await safeReply(chatId, "✏ Send new text (or `skip`):", { parse_mode: "Markdown" });
   }
 
-  // DELETE POST
   if (data.startsWith("del_")) {
     const id = data.split("_")[1];
     await Post.findByIdAndDelete(id);
     cancelJob(id);
     logAudit(q.from.id, "DELETE_POST", { postId: id });
+    logger.info(`Post deleted: ${id}`);
     await safeReply(chatId, "✅ Post deleted.");
   }
 
-  // PAUSE/RESUME
+  // 🔴 NEW: Test post immediately
+  if (data.startsWith("test_")) {
+    const id = data.split("_")[1];
+    const post = await Post.findById(id);
+    if (post) {
+      logger.info(`Testing post: ${id}`);
+      await sendPost(post);
+      await safeReply(chatId, `🧪 Test sent! Check your messages.`);
+    }
+  }
+
   if (data === "pause") {
     isPaused = true;
     logAudit(q.from.id, "PAUSE_BOT", {});
+    logger.warn("Bot PAUSED by admin");
     await safeReply(chatId, "⏸ Bot paused.", { parse_mode: "Markdown" });
   }
 
   if (data === "resume") {
     isPaused = false;
     logAudit(q.from.id, "RESUME_BOT", {});
+    logger.warn("Bot RESUMED by admin");
     await safeReply(chatId, "▶ Bot resumed.", { parse_mode: "Markdown" });
-  }
-
-  if (data === "stats") {
-    const [users, posts] = await Promise.all([Chat.countDocuments(), Post.countDocuments()]);
-    const status = isPaused ? "⏸ Paused" : "▶ Running";
-    await safeReply(chatId, `📊 *Bot Stats*\n\n👥 Users: ${users}\n📬 Posts: ${posts}\n🔄 Status: ${status}`, {
-      parse_mode: "Markdown",
-    });
   }
 
   bot.answerCallbackQuery(q.id).catch(() => {});
@@ -318,7 +313,9 @@ bot.on("message", async (msg) => {
       await Post.findByIdAndUpdate(state.postId, { hour, minute });
       cancelJob(state.postId);
       const updated = await Post.findById(state.postId);
-      if (updated?.daily) scheduleDaily(updated);
+      if (updated?.daily) {
+        scheduleDaily(updated);
+      }
     }
 
     delete editState[msg.from.id];
@@ -346,8 +343,9 @@ bot.onText(/\/daily (\d{1,2}):(\d{2}) (.+)/, async (msg, m) => {
   });
 
   scheduleDaily(post);
-  logAudit(msg.from.id, "CREATE_DAILY", { postId: post._id, text });
-  safeReply(msg.chat.id, `✅ Daily @ ${pad(hour)}:${pad(minute)}`, { parse_mode: "Markdown" });
+  logger.info(`Daily post created: ${post._id} @ ${pad(hour)}:${pad(minute)}`);
+  logAudit(msg.from.id, "CREATE_DAILY", { postId: post._id, text, time: `${hour}:${minute}` });
+  safeReply(msg.chat.id, `✅ Daily post set for *${pad(hour)}:${pad(minute)} ${TIMEZONE}*`, { parse_mode: "Markdown" });
 });
 
 // ===== MEDIA DAILY =====
@@ -379,8 +377,9 @@ bot.on("message", async (msg) => {
   });
 
   scheduleDaily(post);
+  logger.info(`Media daily post created: ${post._id} (${type}) @ ${pad(hour)}:${pad(minute)}`);
   logAudit(msg.from.id, "CREATE_MEDIA_DAILY", { postId: post._id, type });
-  safeReply(msg.chat.id, `✅ Media daily @ ${pad(hour)}:${pad(minute)}`, { parse_mode: "Markdown" });
+  safeReply(msg.chat.id, `✅ Media daily set for *${pad(hour)}:${pad(minute)} ${TIMEZONE}*`, { parse_mode: "Markdown" });
 });
 
 // ===== /SCHEDULE ONE-TIME =====
@@ -405,13 +404,17 @@ bot.onText(/\/schedule (\d{1,2}):(\d{2}) (.+)/, async (msg, m) => {
     text,
     time: date,
     daily: false,
+    nextRun: date,
   });
 
   schedule.scheduleJob(post._id.toString(), date, () => sendPost(post));
-  logAudit(msg.from.id, "SCHEDULE_POST", { postId: post._id, text });
-
+  scheduledJobs[post._id.toString()] = true;
+  
   const timeStr = date.toLocaleString("en-IN", { timeZone: TIMEZONE });
-  safeReply(msg.chat.id, `📅 Scheduled for ${timeStr}`, { parse_mode: "Markdown" });
+  logger.info(`One-time post scheduled: ${post._id} @ ${timeStr}`);
+  logAudit(msg.from.id, "SCHEDULE_POST", { postId: post._id, text, scheduledFor: timeStr });
+
+  safeReply(msg.chat.id, `📅 Scheduled for *${timeStr}*`, { parse_mode: "Markdown" });
 });
 
 // ===== /BROADCAST WITH TAGS =====
@@ -429,9 +432,10 @@ bot.onText(/\/broadcast(?:\s+#(.+?))?\s+(.+)/, async (msg, m) => {
   }
 
   const users = await Chat.find(query);
-  let sent = 0,
-    failed = 0;
+  let sent = 0, failed = 0;
   let startTime = Date.now();
+
+  logger.info(`Broadcasting to ${users.length} users...`);
 
   for (const u of users) {
     try {
@@ -457,17 +461,23 @@ bot.onText(/\/broadcast(?:\s+#(.+?))?\s+(.+)/, async (msg, m) => {
   });
 
   logAudit(msg.from.id, "BROADCAST", { sent, failed, tags });
+  logger.info(`Broadcast complete: ${sent} sent, ${failed} failed, ${avgMs}ms avg`);
+  
   safeReply(msg.chat.id, `📢 Sent: ${sent} ✅ | Failed: ${failed} ❌ | Avg: ${avgMs}ms ⏱`);
 });
 
 // ===== SEND POST =====
 async function sendPost(p) {
-  if (isPaused) return;
+  if (isPaused) {
+    logger.warn(`Post ${p._id} not sent (bot paused)`);
+    return;
+  }
 
   const users = await Chat.find({ blocked: false });
-  let sent = 0,
-    failed = 0;
+  let sent = 0, failed = 0;
   let startTime = Date.now();
+
+  logger.info(`Sending post ${p._id} to ${users.length} users...`);
 
   for (const u of users) {
     try {
@@ -504,30 +514,52 @@ async function sendPost(p) {
     avgDeliveryMs: avgMs,
   });
 
-  console.log(`📨 Post sent: ${sent} ✅ | ${failed} ❌ | ${avgMs}ms ⏱`);
+  logger.info(`✅ Post ${p._id} sent: ${sent} success, ${failed} failed, ${avgMs}ms avg`);
 }
 
 // ===== SCHEDULE DAILY JOB =====
 function scheduleDaily(p) {
   cancelJob(p._id.toString());
-  schedule.scheduleJob(p._id.toString(), {
+  
+  const now = nowIST();
+  const nextRun = new Date(now);
+  nextRun.setHours(p.hour, p.minute, 0, 0);
+  
+  if (nextRun <= now) {
+    nextRun.setDate(nextRun.getDate() + 1);
+  }
+
+  const job = schedule.scheduleJob(p._id.toString(), {
     hour: p.hour,
     minute: p.minute,
     tz: TIMEZONE,
   }, () => sendPost(p));
+
+  scheduledJobs[p._id.toString()] = true;
+  
+  logger.info(`Daily job scheduled: ${p._id} @ ${pad(p.hour)}:${pad(p.minute)} (next run: ${nextRun.toLocaleString("en-IN", { timeZone: TIMEZONE })})`);
+
+  // Update next run in DB
+  Post.findByIdAndUpdate(p._id, { nextRun }).catch(() => {});
 }
 
 // ===== CANCEL JOB =====
 function cancelJob(id) {
   const job = schedule.scheduledJobs[id];
-  if (job) job.cancel();
+  if (job) {
+    job.cancel();
+    delete scheduledJobs[id];
+    logger.debug(`Job cancelled: ${id}`);
+  }
 }
 
 // ===== LOAD JOBS ON STARTUP =====
 async function loadJobs() {
   const posts = await Post.find();
   const now = new Date();
-  let loaded = 0;
+  let loaded = 0, skipped = 0;
+
+  logger.info(`Loading ${posts.length} posts from database...`);
 
   for (const p of posts) {
     if (p.daily) {
@@ -535,36 +567,29 @@ async function loadJobs() {
       loaded++;
     } else if (p.time && new Date(p.time) > now) {
       schedule.scheduleJob(p._id.toString(), new Date(p.time), () => sendPost(p));
+      scheduledJobs[p._id.toString()] = true;
       loaded++;
+    } else {
+      skipped++;
     }
   }
 
-  console.log(`⏰ Loaded ${loaded} jobs`);
+  logger.info(`✅ Jobs loaded: ${loaded} active, ${skipped} skipped (expired)`);
 }
 
-// ===== CLEANUP OLD POSTS =====
-async function cleanupOldPosts() {
-  const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-  const deleted = await Post.deleteMany({
-    daily: false,
-    time: { $lt: thirtyDaysAgo },
-  });
-  console.log(`🧹 Cleaned ${deleted.deletedCount} old posts`);
-}
-
-setInterval(cleanupOldPosts, CLEANUP_INTERVAL);
-
-// ===== REST API =====
+// ===== REST API - DEBUG ENDPOINTS =====
 app.get("/", (req, res) => {
   res.json({
     status: "running",
     paused: isPaused,
     uptime: process.uptime(),
+    timezone: TIMEZONE,
+    activeJobs: Object.keys(scheduledJobs).length,
   });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() });
+  res.json({ ok: true, uptime: process.uptime(), timezone: TIMEZONE });
 });
 
 app.get("/api/stats", async (req, res) => {
@@ -573,7 +598,7 @@ app.get("/api/stats", async (req, res) => {
     Post.countDocuments(),
     Chat.countDocuments({ blocked: true }),
   ]);
-  res.json({ users, posts, blocked, paused: isPaused });
+  res.json({ users, posts, blocked, paused: isPaused, activeJobs: Object.keys(scheduledJobs).length });
 });
 
 app.get("/api/posts", async (req, res) => {
@@ -586,13 +611,73 @@ app.get("/api/analytics", async (req, res) => {
   res.json(analytics);
 });
 
+// 🔴 NEW: Debug endpoint to see all scheduled jobs
+app.get("/api/debug/jobs", async (req, res) => {
+  const posts = await Post.find();
+  const jobDetails = [];
+
+  for (const p of posts) {
+    const isScheduled = !!scheduledJobs[p._id.toString()];
+    const now = nowIST();
+    let nextRun = "Not scheduled";
+
+    if (p.daily) {
+      const next = new Date(now);
+      next.setHours(p.hour, p.minute, 0, 0);
+      if (next <= now) next.setDate(next.getDate() + 1);
+      nextRun = next.toLocaleString("en-IN", { timeZone: TIMEZONE });
+    } else if (p.time) {
+      nextRun = new Date(p.time).toLocaleString("en-IN", { timeZone: TIMEZONE });
+    }
+
+    jobDetails.push({
+      id: p._id,
+      text: p.text.substring(0, 50),
+      type: p.type,
+      daily: p.daily,
+      time: p.daily ? `${pad(p.hour)}:${pad(p.minute)}` : p.time,
+      nextRun: nextRun,
+      isScheduled: isScheduled,
+      sentCount: p.sentCount,
+      failCount: p.failCount,
+    });
+  }
+
+  res.json({
+    timezone: TIMEZONE,
+    currentTime: nowIST().toLocaleString("en-IN", { timeZone: TIMEZONE }),
+    totalJobs: jobDetails.length,
+    activeJobs: Object.keys(scheduledJobs).length,
+    paused: isPaused,
+    jobs: jobDetails,
+  });
+});
+
+// 🔴 NEW: Debug endpoint to manually test a post
+app.post("/api/debug/test-post/:id", async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  if (!post) return res.json({ error: "Post not found" });
+
+  logger.info(`Manual test triggered for post: ${post._id}`);
+  await sendPost(post);
+
+  res.json({ status: "Test sent!", postId: post._id });
+});
+
 // ===== ERROR HANDLERS =====
-bot.on("polling_error", (err) => console.error("❌ Polling error:", err.message));
-process.on("unhandledRejection", (err) => console.error("❌ Unhandled rejection:", err));
+bot.on("polling_error", (err) => logger.error(`Polling error: ${err.message}`));
+process.on("unhandledRejection", (err) => logger.error(`Unhandled rejection: ${err}`));
 
 // ===== SERVER =====
 app.listen(PORT, async () => {
-  console.log(`🌐 Server running on port ${PORT}`);
-  console.log(`🔐 Webhook secret: ${WEBHOOK_SECRET}`);
+  logger.info(`Server running on port ${PORT}`);
+  logger.info(`Timezone: ${TIMEZONE}`);
+  logger.info(`Bot Token loaded: ${token.substring(0, 10)}...`);
+  logger.info(`MongoDB URL: ${MONGO.substring(0, 40)}...`);
+  logger.info(`Dashboard: http://localhost:${PORT}`);
+  logger.info(`Debug jobs: http://localhost:${PORT}/api/debug/jobs`);
+  
   await loadJobs();
+  
+  logger.info("🚀 Bot ready!");
 });
