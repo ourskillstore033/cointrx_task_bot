@@ -1,6 +1,3 @@
-console.log("TOKEN:", process.env.BOT_TOKEN);
-console.log("MONGO:", process.env.MONGO_URL);
-
 const TelegramBot = require("node-telegram-bot-api");
 const mongoose = require("mongoose");
 const schedule = require("node-schedule");
@@ -10,7 +7,7 @@ const express = require("express");
 const token = process.env.BOT_TOKEN;
 const MONGO = process.env.MONGO_URL;
 
-// 👉 ADD ADMINS
+// ===== ADMIN =====
 const ADMIN_IDS = [6517248246, 7419362470, 8530664171];
 
 // ===== INIT =====
@@ -24,146 +21,97 @@ mongoose.connection.once("open", () => {
 });
 
 // ===== SCHEMA =====
-const postSchema = new mongoose.Schema({
-  chatId: Number,
+const Post = mongoose.model("Post", new mongoose.Schema({
   type: String,
   fileId: String,
   text: String,
-  time: Date,
   daily: Boolean,
   hour: Number,
   minute: Number
-});
-const Post = mongoose.model("Post", postSchema);
+}));
 
-const chatSchema = new mongoose.Schema({
+const Chat = mongoose.model("Chat", new mongoose.Schema({
   chatId: Number
-});
-const Chat = mongoose.model("Chat", chatSchema);
+}));
 
 // ===== HELPERS =====
 const isAdmin = (msg) => ADMIN_IDS.includes(msg.from.id);
 let isPaused = false;
+let editMode = {}; // userId => postId
 
-// ===== SINGLE MESSAGE HANDLER (FIXED) =====
+// ===== SAVE USERS =====
 bot.on("message", async (msg) => {
-  try {
-    // Save user chat
-    const exists = await Chat.findOne({ chatId: msg.chat.id });
-    if (!exists) await Chat.create({ chatId: msg.chat.id });
-
-    // Only admins for scheduling
-    if (!isAdmin(msg)) return;
-
-    // ===== MEDIA DAILY =====
-    if (msg.caption && msg.caption.startsWith("/daily")) {
-      const match = msg.caption.match(/\/daily (\d{1,2}):(\d{2}) (.+)/);
-
-      if (!match) {
-        return bot.sendMessage(msg.chat.id, "❌ Format: /daily HH:MM message");
-      }
-
-      let hour = parseInt(match[1]);
-      let minute = parseInt(match[2]);
-      const text = match[3];
-
-      let type = null;
-      let fileId = null;
-
-      if (msg.photo) {
-        type = "photo";
-        fileId = msg.photo[msg.photo.length - 1].file_id;
-      } else if (msg.video) {
-        type = "video";
-        fileId = msg.video.file_id;
-      }
-
-      if (!type) {
-        return bot.sendMessage(msg.chat.id, "❌ Send photo or video only");
-      }
-
-      const post = await Post.create({
-        chatId: msg.chat.id,
-        type,
-        fileId,
-        text,
-        daily: true,
-        hour,
-        minute
-      });
-
-      console.log(`⏰ Media scheduled at ${hour}:${minute} IST`);
-
-      schedule.scheduleJob(post._id.toString(), {
-        hour,
-        minute,
-        tz: "Asia/Kolkata"
-      }, async () => sendPost(post));
-
-      return bot.sendMessage(msg.chat.id, `✅ Media daily set ID: ${post._id}`);
-    }
-
-  } catch (err) {
-    console.log(err);
-  }
+  const exists = await Chat.findOne({ chatId: msg.chat.id });
+  if (!exists) await Chat.create({ chatId: msg.chat.id });
 });
 
-// ===== START UI =====
+// ===== ADMIN PANEL =====
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "🚀 Control Panel", {
+  if (!isAdmin(msg)) return;
+
+  bot.sendMessage(msg.chat.id, "🚀 Admin Panel", {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "📅 Schedule Post", callback_data: "schedule" }],
-        [{ text: "🔁 Daily Post", callback_data: "daily" }],
-        [{ text: "🖼 Send Media Daily", callback_data: "media" }],
+        [{ text: "📅 Daily Text", callback_data: "daily_text" }],
+        [{ text: "🖼 Daily Media", callback_data: "daily_media" }],
         [{ text: "📋 View Posts", callback_data: "list" }],
-        [{ text: "📢 Broadcast", callback_data: "broadcast" }],
-        [{ text: "📊 Stats", callback_data: "stats" }],
-        [
-          { text: "⏸ Pause", callback_data: "pause" },
-          { text: "▶ Resume", callback_data: "resume" }
-        ]
+        [{ text: "⏸ Pause", callback_data: "pause" }, { text: "▶ Resume", callback_data: "resume" }]
       ]
     }
   });
 });
 
-// ===== CALLBACK =====
+// ===== BUTTONS =====
 bot.on("callback_query", async (q) => {
   if (!ADMIN_IDS.includes(q.from.id)) return;
 
   const msg = q.message;
 
-  const messages = {
-    schedule: "Use:\n/schedule 19:01 Hello",
-    daily: "Use:\n/daily 09:00 Good Morning",
-    media: "Send photo/video with caption:\n/daily 19:00 Message",
-    broadcast: "Use:\n/broadcast message"
-  };
+  if (q.data === "daily_text") {
+    bot.sendMessage(msg.chat.id, "Use:\n/daily 09:00 Hello");
+  }
 
-  if (messages[q.data]) {
-    bot.sendMessage(msg.chat.id, messages[q.data]);
+  if (q.data === "daily_media") {
+    bot.sendMessage(msg.chat.id, "Send photo/video with caption:\n/daily 09:00 Message");
   }
 
   if (q.data === "list") {
     const posts = await Post.find();
-    let text = "📋 POSTS:\n\n";
 
-    posts.forEach(p => {
-      text += `ID: ${p._id}\n`;
-      text += p.daily
-        ? `Daily: ${p.hour}:${p.minute}\n`
-        : `One-time\n`;
-      text += `Type: ${p.type}\nMsg: ${p.text}\n\n`;
-    });
+    if (!posts.length) return bot.sendMessage(msg.chat.id, "No posts");
 
-    bot.sendMessage(msg.chat.id, text || "No posts");
+    for (let p of posts) {
+      bot.sendMessage(msg.chat.id,
+        `ID: ${p._id}\nTime: ${p.hour}:${p.minute}\nText: ${p.text}`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "✏ Edit", callback_data: `edit_${p._id}` },
+                { text: "❌ Delete", callback_data: `del_${p._id}` }
+              ]
+            ]
+          }
+        }
+      );
+    }
   }
 
-  if (q.data === "stats") {
-    const users = await Chat.countDocuments();
-    const posts = await Post.countDocuments();
-    bot.sendMessage(msg.chat.id, `📊 Users: ${users}\nPosts: ${posts}`);
+  if (q.data.startsWith("edit_")) {
+    const id = q.data.split("_")[1];
+    editMode[q.from.id] = id;
+    bot.sendMessage(msg.chat.id, "✏ Send new text for this post");
+  }
+
+  if (q.data.startsWith("del_")) {
+    const id = q.data.split("_")[1];
+
+    await Post.findByIdAndDelete(id);
+
+    const job = schedule.scheduledJobs[id];
+    if (job) job.cancel();
+
+    bot.sendMessage(msg.chat.id, "❌ Deleted");
   }
 
   if (q.data === "pause") {
@@ -179,16 +127,30 @@ bot.on("callback_query", async (q) => {
   bot.answerCallbackQuery(q.id);
 });
 
+// ===== EDIT HANDLER =====
+bot.on("message", async (msg) => {
+  if (!isAdmin(msg)) return;
+
+  if (editMode[msg.from.id]) {
+    const postId = editMode[msg.from.id];
+
+    await Post.findByIdAndUpdate(postId, { text: msg.text });
+
+    editMode[msg.from.id] = null;
+
+    bot.sendMessage(msg.chat.id, "✅ Post updated");
+  }
+});
+
 // ===== DAILY TEXT =====
 bot.onText(/\/daily (\d{1,2}):(\d{2}) (.+)/, async (msg, m) => {
   if (!isAdmin(msg)) return;
 
-  let hour = parseInt(m[1]);
-  let minute = parseInt(m[2]);
+  const hour = parseInt(m[1]);
+  const minute = parseInt(m[2]);
   const text = m[3];
 
   const post = await Post.create({
-    chatId: msg.chat.id,
     type: "text",
     text,
     daily: true,
@@ -196,90 +158,80 @@ bot.onText(/\/daily (\d{1,2}):(\d{2}) (.+)/, async (msg, m) => {
     minute
   });
 
-  console.log(`⏰ Text scheduled at ${hour}:${minute} IST`);
+  schedulePost(post);
 
-  schedule.scheduleJob(post._id.toString(), {
-    hour,
-    minute,
-    tz: "Asia/Kolkata"
-  }, async () => sendPost(post));
-
-  bot.sendMessage(msg.chat.id, `🔁 Daily set ID: ${post._id}`);
+  bot.sendMessage(msg.chat.id, "✅ Daily text set");
 });
 
-// ===== SEND POST =====
+// ===== MEDIA DAILY =====
+bot.on("message", async (msg) => {
+  if (!isAdmin(msg)) return;
+
+  if (msg.caption && msg.caption.startsWith("/daily") && (msg.photo || msg.video)) {
+
+    const match = msg.caption.match(/\/daily (\d{1,2}):(\d{2}) (.+)/);
+    if (!match) return;
+
+    const hour = parseInt(match[1]);
+    const minute = parseInt(match[2]);
+    const text = match[3];
+
+    let type = msg.photo ? "photo" : "video";
+    let fileId = msg.photo
+      ? msg.photo[msg.photo.length - 1].file_id
+      : msg.video.file_id;
+
+    const post = await Post.create({
+      type,
+      fileId,
+      text,
+      daily: true,
+      hour,
+      minute
+    });
+
+    schedulePost(post);
+
+    bot.sendMessage(msg.chat.id, "✅ Media daily set");
+  }
+});
+
+// ===== SCHEDULE =====
+function schedulePost(p) {
+  schedule.scheduleJob(p._id.toString(), {
+    hour: p.hour,
+    minute: p.minute,
+    tz: "Asia/Kolkata"
+  }, () => sendPost(p));
+}
+
+// ===== SEND =====
 async function sendPost(p) {
   if (isPaused) return;
 
-  console.log("🚀 Sending post:", p._id);
+  const users = await Chat.find();
 
-  try {
-    if (p.type === "photo") {
-      await bot.sendPhoto(p.chatId, p.fileId, { caption: p.text });
-    } else if (p.type === "video") {
-      await bot.sendVideo(p.chatId, p.fileId, { caption: p.text });
-    } else {
-      await bot.sendMessage(p.chatId, p.text);
-    }
-  } catch (err) {
-    console.log("❌ Send error:", err.message);
-  }
-}
-
-// ===== DELETE =====
-bot.onText(/\/delete (.+)/, async (msg, m) => {
-  if (!isAdmin(msg)) return;
-
-  const id = m[1];
-  await Post.findByIdAndDelete(id);
-
-  const job = schedule.scheduledJobs[id];
-  if (job) job.cancel();
-
-  bot.sendMessage(msg.chat.id, "❌ Deleted");
-});
-
-// ===== BROADCAST =====
-bot.onText(/\/broadcast (.+)/, async (msg, m) => {
-  if (!isAdmin(msg)) return;
-
-  const chats = await Chat.find();
-
-  for (let c of chats) {
+  for (let u of users) {
     try {
-      await bot.sendMessage(c.chatId, m[1]);
+      if (p.type === "photo") {
+        await bot.sendPhoto(u.chatId, p.fileId, { caption: p.text });
+      } else if (p.type === "video") {
+        await bot.sendVideo(u.chatId, p.fileId, { caption: p.text });
+      } else {
+        await bot.sendMessage(u.chatId, p.text);
+      }
     } catch {}
   }
-
-  bot.sendMessage(msg.chat.id, "📢 Sent");
-});
+}
 
 // ===== LOAD JOBS =====
 async function loadJobs() {
   const posts = await Post.find();
-
-  posts.forEach(p => {
-    if (p.daily) {
-      schedule.scheduleJob(p._id.toString(), {
-        hour: p.hour,
-        minute: p.minute,
-        tz: "Asia/Kolkata"
-      }, async () => sendPost(p));
-    } else if (p.time) {
-      schedule.scheduleJob(p._id.toString(), p.time, async () => sendPost(p));
-    }
-  });
-
-  console.log("🚀 Jobs Loaded");
+  posts.forEach(schedulePost);
 }
 loadJobs();
 
 // ===== EXPRESS =====
-app.get("/", (req, res) => {
-  res.send("Bot is running");
-});
+app.get("/", (req, res) => res.send("Bot running"));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("🌐 Server running on port " + PORT);
-});
+app.listen(process.env.PORT || 3000);
