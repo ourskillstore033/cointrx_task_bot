@@ -1,18 +1,35 @@
 {
-  "name": "cointrx-bot",
-  "version": "1.0.0",
+  "name": "telegram-bot-control-center",
+  "version": "2.0.0",
+  "description": "Advanced Telegram bot with web dashboard, game, and analytics",
   "main": "bot1.js",
-  "type": "commonjs",
   "scripts": {
-    "start": "node bot1.js"
+    "start": "node bot1.js",
+    "dev": "nodemon bot1.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [
+    "telegram",
+    "bot",
+    "scheduler",
+    "broadcast",
+    "dashboard"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
-    "node-schedule": "^2.1.1",
     "mongoose": "^7.6.0",
-    "express": "^4.18.2"
+    "node-schedule": "^2.1.1",
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
   }
 }
